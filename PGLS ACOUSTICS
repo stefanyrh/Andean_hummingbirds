@@ -1,0 +1,299 @@
+title: "Andean hummingbirds"
+author: "Stefany Rodríguez, Orlando Acevedo-Charry, Simon S. Riley, & Marcia C. Muñoz"
+
+library(tidyverse)
+library(readr)
+library(rjags) # impute
+library(dclone) # impute
+library(coda) # impute
+library(nlme)
+library(ggResidpanel)
+library(AICcmodavg)
+library(emmeans)
+library(multcomp)
+library(MetBrewer)
+library(ape)
+library(nlme)
+library(phytools)
+library(ggtree) #plot pretty phylogenetic trees; see https://bioconductor.org/packages/release/bioc/html/ggtree.ht
+BiocManager::install("ggtree")
+(!require("BiocManager", quietly = TRUE))
+install.packages("BiocManager")
+
+# Read and prep data - Acoustic measurements for hummingbirds
+acoustics = read_csv('acoustics.csv') |>
+filter(Specie != "Heliomaster longirostris") |>
+mutate(# eight species changed recently in taxonomy or had double space
+       Species = ifelse(Specie == "Heliangelus amethysticolis",
+                  "Heliangelus clarisse",
+                  ifelse(Specie == "Eriocnemis  cupreoventris",
+                  "Eriocnemis cupreoventris",
+                  ifelse(Specie == "Heliodoxa  imperatrix",
+                  "Heliodoxa imperatrix",
+                  ifelse(Specie == "Heliodoxa  jacula",
+                  "Heliodoxa jacula",
+                  ifelse(Specie == "Heliodoxa  leadbeateri",
+                  "Heliodoxa leadbeateri",
+                  ifelse(Specie == "Heliodoxa  rubinoides",
+                  "Heliodoxa rubinoides",
+                  ifelse(Specie == "Ocreatus  underwoodii",
+                  "Ocreatus underwoodii",
+                  ifelse(Specie == "Aglaiocercus kingi",
+                  "Aglaiocercus kingii",
+                  Specie)))))))),
+                  habitat = case_when(habitat == "Alta Montaña" ~ "high mountain",
+                  habitat == "Bosque Andino" ~ "forests"),
+        #Responses variables in numeric form (check values...)
+                  FMin = as.numeric(`minimum Frequency`),
+                  FPeak = as.numeric(`peak Frequency`),
+                  FMax = as.numeric(`maximum Frequency`),
+                  NDura = as.numeric(`note duration`),
+                  beak = `length beak`) |> 
+                  dplyr::select(ID_Audio_Specimen, Clade, Specie, habitat,
+                  FMin, FPeak, FMax, NDura, 
+                  beak, bodyMass, elevation) |>
+  #this specimen of Ensifera ensifera has decimal maximum frequency!
+  filter(ID_Audio_Specimen != "XC17326") |>
+  #there is a specimen with two different species (mistake!)
+  filter(ID_Audio_Specimen != "ML388111931")
+
+#An error in _Heliomaster longirostris_ (XC197771) regarding elevation was modified.
+acoustics[c(49,50,51),11] <- 462 
+
+summary(acoustics) 
+
+#Scale Elevation and discrete ranges
+acoustics_elev <- acoustics |>
+  mutate(
+    #Scale elevation as predictor
+    ElevationScaled = scale(elevation),
+    #Convert discrete range of elevation with the Inter Quantile Range
+    ElevationRange = case_when(elevation <= quantile(acoustics$elevation, 
+                                                     probs = 0.25) ~ 'low',
+                               elevation > quantile(acoustics$elevation, 
+                                                    probs = 0.75) ~ 'high',
+                               TRUE ~ 'middle')) 
+
+#Generate mean responses variables from the three notes measured
+acoustics_specimen <- acoustics |>
+  group_by(ID_Audio_Specimen) |>
+  summarise(FMin = mean(FMin), 
+            FPeak = mean(FPeak),
+            FMax = mean(FMax),
+            NDura = mean(NDura)) |>
+  left_join(acoustics_elev |>
+              dplyr::select(ID_Audio_Specimen, Specie, 
+                            Clade, habitat, ElevationRange, 
+                            elevation, beak, bodyMass, ElevationScaled)) |>
+  unique()
+
+#Multiple variable
+# To fit a multivariate model we need to convert the data to long form.
+acoustics_long = acoustics_specimen |> 
+  pivot_longer(cols = c(FMin, 
+                        FPeak, 
+                        FMax, 
+                        NDura), 
+               names_to = 'trait', values_to = 'measure')
+
+acoustics_long$trait <- as.factor(acoustics_long$trait)
+
+# Phylogenetic signal
+
+#Load the phylogenetic tree
+phylo_tree_cor = readRDS('/Users/macbookpro/Desktop/phylo_tree_cor.rda')
+
+tree <- read.nexus("/Users/macbookpro/Desktop/summary_dated_clements.nex")
+
+#Adjust name as in the phylogeny, and reorder the data
+acoustics$Spp_phylo <- gsub(" ", "_", acoustics$Specie)
+
+acoustics <- acoustics |>
+  relocate(c(Specie, Spp_phylo), .before = Clade) |>
+  relocate(c(Specie, Spp_phylo, Clade), .before = ID_Audio_Specimen)
+
+#Select the species and prune the the tree
+species <- unique(acoustics$Spp_phylo)
+
+tree_spp <- drop.tip(tree, setdiff(tree$tip.label, species))
+tree_spp
+plot(tree_spp, cex = 0.6)
+
+#Now we need to homogenize the tree tip labels with our species names. We replace "_" between names with a space.
+tree_spp$tip.label = gsub(tree_spp$tip.label, 
+                          pattern = "_", replacement = " ")
+
+#Here, we compute the correlation matrix using `ape`.
+# Create correlation matrix for analysis
+phylo_tree_cor = ape::vcv(tree_spp, cor = T)
+saveRDS(phylo_tree_cor, '/Users/macbookpro/Desktop/phylo_tree_cor.rda')
+
+#Finally, we will plot the tree using blue for coquettes and orange for brilliants
+met.brewer("Renoir", n = 2)
+taxa_palette = c('coquettes'=as.vector(met.brewer("Renoir", n = 2))[2], 
+                 'brilliants'= as.vector(met.brewer("Renoir", n = 2))[1])
+
+a = ggtree(tree_spp) %<+% acoustics + 
+  geom_tiplab(aes(color = Clade), #label = ott_species), 
+              align = TRUE, size = 4.3, offset = 0.0, fontface = 3) + 
+  # , align = TRUE, size = 3, offset = 0.1)
+  scale_color_manual(values = taxa_palette) +
+  theme_tree()+
+  theme(axis.text = element_text(size = 12),
+        legend.position = "none", #c(0.48,0.89)
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 14),
+        legend.background = element_blank(),
+        plot.margin =margin(0, 0, 0,-5, unit = "cm")) +
+  scale_y_continuous(expand=c(0, 1)) +
+  scale_x_continuous(expand=c(1, 0.5))
+```
+a
+
+## Phylogenetic Generalized Least-Squares (PGLS) in Acoustics
+
+#Model selection for acoustic multivariate
+resp_var = 'measure'  # define response variable
+
+# Create a list containing one-sided formulas for all the candidate models
+form_list = list(
+  ~ trait/1,                              #mod1
+  ~ trait/beak,                           #mod2
+  ~ trait/bodyMass,                       #mod3
+  ~ trait/ElevationRange,                 #mod4
+  ~ trait/habitat,                        #mod5
+  ~ trait/Clade,                          #mod6
+  ~ trait/beak + ElevationRange,          #mod7
+  ~ trait/beak + habitat,                 #mod8
+  ~ trait/beak + Clade,                   #mod9
+  ~ trait/beak * ElevationRange,          #mod10
+  ~ trait/beak * habitat,                 #mod11
+  ~ trait/beak * Clade,                   #mod12
+  ~ trait/bodyMass + ElevationRange,      #mod13
+  ~ trait/bodyMass + habitat,             #mod14
+  ~ trait/bodyMass + Clade,               #mod15
+  ~ trait/bodyMass * ElevationRange,      #mod16
+  ~ trait/bodyMass * habitat,             #mod17
+  ~ trait/bodyMass * Clade)               #mod18
+
+mod_list= list() # Empty list to save results
+
+# Now iterate through each formula in the form_list...
+mod_list_lambda = list() # Empty list to save results
+
+#To include the phylogenetic correlations, we are going to test three evolutionary models in this section: 
+
+### Pagel's lambda optimization 
+
+# Find species in data that are NOT in the tree
+missing_from_tree <- setdiff(unique(acoustics_long$Specie), tree_spp$tip.label)
+print(missing_from_tree)
+
+# Keep only rows where the species exists in the tree
+acoustics_long <- acoustics_long[acoustics_long$Specie %in% tree_spp$tip.label, ]
+
+# Drop unused factor levels
+acoustics_long$Specie <- droplevels(as.factor(acoustics_long$Specie))
+
+for (n in 1:length(form_list)){
+  # ... paste in the name of the response variable...
+  formula_n = formula(paste(resp_var, form_list[n])) 
+  #...fit the model, and save it in the mod_list...
+  mod_list_lambda[[n]] = gls(formula_n, data = acoustics_long, 
+                             correlation = corPagel(1, phy = tree_spp, 
+                                                    form = ~ Specie), 
+                             method = 'ML',
+                             na.action = na.omit)
+  #...and print out which iteration was just completed
+  print(paste('model number: ', n, ' - fit - ', formula_n))
+}
+
+names(mod_list_lambda) = form_list
+
+#Refitting the same models, but with modified formula for the Pagel correlation structure, in which phylogenetic correlation applies within traits but not between them:
+  
+mod_list_lambda_2 = list() # Empty list to save results
+
+# Now iterate through each formula in the form_list...
+for (n in 1:length(form_list)){
+  # ... paste in the name of the response variable...
+  formula_n = formula(paste(resp_var, form_list[n])) 
+  #...fit the model, and save it in the mod_list...
+  mod_list_lambda_2[[n]] = gls(formula_n, data = acoustics_long, 
+                               correlation = corPagel(1, phy = tree_spp, 
+                                                      form = ~ Specie|trait), 
+                               method = 'ML',
+                               na.action = na.omit)
+  #...and print out which iteration was just completed
+  print(paste('model number: ', n, ' - fit - ', formula_n))
+}
+
+names(mod_list_lambda_2) = form_list
+```
+#Check the fitted models (assembled into a list). Note the better fit of all models with phylogenetic correlations within, but not across, traits:
+  
+aictab(mod_list_lambda)      #~trait/beak * ElevationRange  #mod10
+aictab(mod_list_lambda_2)    #~trait/Clade                  #mod6
+
+### Ornstein-Uhlenbeck (OU)
+
+#Models evolution toward an optimal value, useful when selection is suspected.
+
+mod_list_OU = list() # Empty list to save results
+
+# Now iterate through each formula in the form_list...
+for (n in 1:length(form_list)){
+  # ... paste in the name of the response variable...
+  formula_n = formula(paste(resp_var, form_list[n])) 
+  #...fit the model, and save it in the mod_list...
+  mod_list_OU[[n]] = gls(formula_n, data = acoustics_long, 
+                         correlation = corMartins(1, phy = tree_spp, 
+                                                  form = ~ Specie), 
+                         method = 'ML',
+                         na.action = na.omit)
+  #...and print out which iteration was just completed
+  print(paste(resp_var, 'model number', n, 'fit'))
+}
+names(mod_list_OU) = form_list
+```
+#Refitting the same models, but with modified formula for the correlation structure, in which phylogenetic correlation plies within traits but not between them. Note that due to non-convergence for some models, we need an error handler so that the loop isn't interupted. 
+
+# Define function for checking/handling errors:
+tryCatch.W.E = function(expr){
+  W <- NULL
+  w.handler <- function(w) { # warning handler
+    W <<- w
+    invokeRestart("muffleWarning")
+  }
+  list(value = withCallingHandlers(tryCatch(expr, error = function(e) e),
+                                   warning = w.handler),
+       warning = W)
+}
+```
+mod_list_OU_2 = list() # Empty list to save results
+
+# Now iterate through each formula in the form_list...
+for (n in 1:length(form_list)){
+  # ... paste in the name of the response variable...
+  formula_n = formula(paste(resp_var, form_list[n])) 
+  #...fit the model, and save it in the mod_list...
+  mod_list_OU_2[[n]] = tryCatch.W.E({gls(formula_n, data = acoustics_long, 
+                                         correlation = corMartins(1, phy = tree_spp, 
+                                                                  form = ~ Species|trait), 
+                                         method = 'ML',
+                                         na.action = na.omit)})
+  #...and print out which iteration was just completed
+  print(paste(resp_var, 'model number', n, 'fit'))
+}
+names(mod_list_OU_2) = form_list
+
+mod_list_OU_2 = sapply(mod_list_OU_2, \(x){x$value})
+mod_list_OU_2 = mod_list_OU_2[sapply(mod_list_OU_2, \(x) {!('error' %in% class(x))})]
+```
+Check the fitted models (assembled into a list)
+
+```{r}
+# Now the fitted models (already assembled into a list) can be compared with AICc
+
+aictab(mod_list_OU) #~trait/beak * ElevationRange  #mod10  #again mod10!! 
+aictab(mod_list_OU_2)
